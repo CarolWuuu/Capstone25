@@ -1,14 +1,19 @@
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-from scipy.signal import find_peaks
+from numpy.fft import rfft, rfftfreq
+from scipy.signal import find_peaks, correlate, hilbert, savgol_filter
 from sklearn.mixture import GaussianMixture
-
-# === Setup ===
 from sklearn.preprocessing import StandardScaler
+from scipy.optimize import minimize
 
-FILENAME = 'filtered_piezo_voltage_log-1&1-t1.csv'
-SPEED_OF_SOUND = 162900  # cm/s in hydrogel
+# === CONFIG ===
+SOUND_SPEED = 162900  # cm/s
+REF_IDX = 0
+WINDOW_SIZE = 35
+
+file_path = "filtered/filtered_piezo_voltage_log-1&3-t1.csv"
+true_freqs = [2.375, 2.45]
 
 # Sensor coordinates (centimeters)
 sensor_coords = np.array([
@@ -24,97 +29,82 @@ speaker_coords = np.array([
     [7.0, 6.0],
 ])
 
-# === Step 1: Load filtered data ===
-df = pd.read_csv(FILENAME)
-time = df['Timestamp_s'].values  # keep in seconds
-signals = df[[col for col in df.columns if 'Piezo' in col]].values
-NUM_SENSORS = signals.shape[1]
+def estimate_tdoas_crosscorr(signals, peak_indices, fs, ref_idx=0, window_size=35):
+    num_sensors = signals.shape[1]
+    tdoa_matrix = []
 
-# === Step 2: Detect all peaks per sensor ===
-all_peaks = []
-peak_records = []
+    for idx in peak_indices:
+        ref_seg = signals[max(0, idx - window_size):min(len(signals), idx + window_size), ref_idx]
+        row = []
+        for sid in range(num_sensors):
+            if sid == ref_idx:
+                row.append(0.0)
+                continue
+            seg = signals[max(0, idx - window_size):min(len(signals), idx + window_size), sid]
+            min_len = min(len(ref_seg), len(seg))
+            corr = correlate(seg[:min_len], ref_seg[:min_len], mode='full')
+            lag = np.argmax(corr) - (min_len - 1)
+            row.append(lag / fs)
+        tdoa_matrix.append(row)
 
-for i in range(NUM_SENSORS):
-    signal = signals[:, i]
-    gradient = np.diff(signal)
+    return np.mean(tdoa_matrix, axis=0)
 
-    # Peak: rising then falling (local max)
-    peaks = np.where((gradient[:-1] > 0) & (gradient[1:] <= 0))[0] + 1
 
-    # Only keep peaks after time >= 15
-    valid_peaks = peaks[time[peaks] >= 15]
-    all_peaks.append(valid_peaks)
+def reconstruct_source_from_tdoa(signals, tdoas, fs, normalize=True):
+    num_samples, num_sensors = signals.shape
+    max_shift = int(np.max(np.abs(tdoas)) * fs) + 1
+    aligned = np.zeros((num_samples + max_shift, num_sensors))
 
-    for p in valid_peaks:
-        timestamp = time[p]
-        amplitude = signal[p]
-        peak_records.append((timestamp, i, p, amplitude))  # (time, sensor_id, index, amp)
+    for i in range(num_sensors):
+        delay_samples = int(round(tdoas[i] * fs))
+        signal = signals[:, i]
+        envelope = np.abs(hilbert(signal))
+        signal = signal * envelope
 
-# === Step 3: Cluster peaks ===
-ref_idx = 0  # reference sensor
-NUM_SENSORS = signals.shape[1]
-fs = 1 / np.mean(np.diff(time))
+        if delay_samples >= 0:
+            aligned[delay_samples:delay_samples + num_samples, i] = signal
+        else:
+            aligned[0:num_samples + delay_samples, i] = signal[-delay_samples:]
 
-# Build peak features (t, amp, TDOAs)
-peak_features = []
-for (t_i, sensor_id, p_idx, amp_i) in peak_records:
-    feature = [t_i, amp_i]
-    peak_features.append(feature)
-
-features = np.array(peak_features)
-scaled_features = StandardScaler().fit_transform(features)
-
-# Cluster with GMM
-gmm = GaussianMixture(n_components=2, covariance_type='full', random_state=0)
-labels = gmm.fit_predict(scaled_features)
-probabilities = gmm.predict_proba(scaled_features)
-max_probs = np.max(probabilities, axis=1)
-
-# Flag low-confidence peaks
-overlapping_peaks = max_probs < 0.95  # adjust threshold if needed
-
-# Plot signals with clustered peaks
-cluster_colors = ['red', 'blue']
-overlap_color = 'purple'
-
-plt.figure(figsize=(12, 2.5 * NUM_SENSORS))
-for sensor_id in range(NUM_SENSORS):
-    plt.subplot(NUM_SENSORS, 1, sensor_id + 1)
-    plt.plot(time, signals[:, sensor_id], color='black', alpha=0.6, label=f"Sensor {sensor_id}")
-
-    for i, (t_i, sid, p_idx, amp_i) in enumerate(peak_records):
-        if sid == sensor_id:
-            if overlapping_peaks[i]:
-                plt.plot(t_i, signals[p_idx, sid], 'o', color=overlap_color, markersize=5)
-            else:
-                cluster = labels[i]
-                plt.plot(t_i, signals[p_idx, sid], 'o', color=cluster_colors[cluster], markersize=5)
-
-    plt.xlabel("Time (s)")
-    plt.ylabel("Voltage")
-    plt.title(f"Sensor {sensor_id}")
-    plt.grid(True)
-
-plt.tight_layout()
-plt.suptitle("TDOA-Based Peak Clustering", y=1.02, fontsize=16)
-plt.show()
-
-# === Step 4: Group clustered peaks by label and sensor ===
-cluster_peaks = {0: {}, 1: {}}
-
-for (t_i, sensor_id, peak_idx, amp_i), label in zip(peak_records, labels):
-    if sensor_id not in cluster_peaks[label]:
-        cluster_peaks[label][sensor_id] = peak_idx
+    summed = np.sum(aligned, axis=1)
+    if normalize:
+        nonzero = np.sum(aligned != 0, axis=1)
+        nonzero[nonzero == 0] = 1
+        return summed / nonzero
     else:
-        # Use the earlier peak if multiple from same sensor assigned to same cluster
-        if t_i < time[cluster_peaks[label][sensor_id]]:
-            cluster_peaks[label][sensor_id] = peak_idx
+        return summed
+
+def multilateration(sensor_coords, tdoas, sound_speed, ref_index=0):
+    """
+    Estimate source location using nonlinear least squares multilateration.
+    Bounds are fixed to gel region: xmin=2, ymin=2, xmax=20, ymax=12.
+    """
+
+    def residuals(xy):
+        ref_sensor = sensor_coords[ref_index]
+        ref_dist = np.linalg.norm(xy - ref_sensor)
+        total_error = 0.0
+        for i, sensor in enumerate(sensor_coords):
+            if i == ref_index:
+                continue
+            dist = np.linalg.norm(xy - sensor)
+            expected_tdoa = (dist - ref_dist) / sound_speed
+            total_error += (expected_tdoa - tdoas[i]) ** 2
+        return total_error
+
+    # Initial guess: center of the gel region
+    initial_guess = np.mean(sensor_coords, axis=0)
+
+    result = minimize(residuals, initial_guess, method='L-BFGS-B')
+    if result.success:
+        return result.x
+    else:
+        return None
 
 
-# === Step 5: localization function ===
 def grid_search_localization(sensor_coords, tdoas, ref_index=0, sound_speed=162900, grid_size=100):
-    xmin, ymin = [2,2]
-    xmax, ymax = [20,12]
+    xmin, ymin = [2, 2]
+    xmax, ymax = [20, 12]
 
     grid_x, grid_y = np.meshgrid(
         np.linspace(xmin, xmax, grid_size),
@@ -138,207 +128,174 @@ def grid_search_localization(sensor_coords, tdoas, ref_index=0, sound_speed=1629
     return (est_x, est_y), error_grid, grid_x, grid_y
 
 
-cluster_sources = {}
 
-for cluster_id in cluster_peaks:
-    peak_dict = cluster_peaks[cluster_id]
+def main():
+    df = pd.read_csv(file_path)
+    time = df['Timestamp_s'].values
+    fs = 1 / np.mean(np.diff(time))
+    sensor_cols = [col for col in df.columns if 'Piezo' in col]
+    signals = df[sensor_cols].values
+    num_sensors = len(sensor_cols)
 
-    # Only proceed if at least 3 sensors contributed peaks
-    if len(peak_dict) < 3:
-        print(f"Cluster {cluster_id}: Not enough peaks for localization.")
-        continue
+    # Only use data after 5 seconds
+    valid_mask = time >= 7
+    time = time[valid_mask]
+    signals = signals[valid_mask, :]
 
-    # Get peak times for each sensor in the cluster
-    tdoas = np.zeros(NUM_SENSORS)
-    ref_time = time[peak_dict[ref_idx]]
+    ref_signal = signals[:, REF_IDX]
+    peak_indices, _ = find_peaks(ref_signal, height=0.3 * np.max(ref_signal))
 
-    for i in range(NUM_SENSORS):
-        if i in peak_dict:
-            tdoas[i] = time[peak_dict[i]] - ref_time
+    tdoa_features = []
+    peak_records = []
+
+    for idx in peak_indices:
+        t_ref = time[idx]
+        record = []
+        peak_records.append((t_ref, REF_IDX, idx, ref_signal[idx]))
+
+        for sid in range(num_sensors):
+            if sid == REF_IDX:
+                record.append(0.0)
+                continue
+            seg_ref = ref_signal[max(0, idx - WINDOW_SIZE):min(len(ref_signal), idx + WINDOW_SIZE)]
+            seg_other = signals[max(0, idx - WINDOW_SIZE):min(len(signals), idx + WINDOW_SIZE), sid]
+            min_len = min(len(seg_ref), len(seg_other))
+            corr = correlate(seg_other[:min_len], seg_ref[:min_len], mode='full')
+            lag = np.argmax(corr) - (min_len - 1)
+            record.append(lag / fs)
+
+        tdoa_features.append(record)
+
+    tdoa_features = np.array(tdoa_features)
+
+    scaler = StandardScaler()
+    tdoa_scaled = scaler.fit_transform(tdoa_features)
+    gmm = GaussianMixture(n_components=2, random_state=0).fit(tdoa_scaled)
+    labels = gmm.predict(tdoa_scaled)
+
+    cluster_signals = {}
+    for cid in [0, 1]:
+        cluster_idx = np.where(labels == cid)[0]
+        if len(cluster_idx) == 0:
+            continue
+        cluster_peaks = [peak_indices[i] for i in cluster_idx]
+        cluster_tdoas = estimate_tdoas_crosscorr(signals, cluster_peaks, fs, ref_idx=REF_IDX, window_size=WINDOW_SIZE)
+        tdoas = list(cluster_tdoas)
+        cluster_signal = reconstruct_source_from_tdoa(signals, tdoas, fs)
+        cluster_signals[cid] = cluster_signal[:len(time)]
+
+    plt.figure(figsize=(12, 6))
+    for cid, sig in cluster_signals.items():
+        plt.plot(time, sig, label=f'Cluster {cid}')
+    plt.title("Reconstructed Source Signals (TDOA Clustering)")
+    plt.xlabel("Time (s)")
+    plt.ylabel("Amplitude (V)")
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+    estimated_freqs = {}
+    for label in [0, 1]:
+        avg_signal = cluster_signals[label]
+        fft_mag = np.abs(np.fft.rfft(avg_signal))
+        freqs = np.fft.rfftfreq(len(avg_signal), d=1 / fs)
+
+        envelope = np.abs(hilbert(fft_mag))
+        smooth_envelope = savgol_filter(envelope, window_length=31, polyorder=3)
+
+        # Find all peaks
+        peak_indices, properties = find_peaks(smooth_envelope, height=0.6 * np.max(smooth_envelope))
+
+        # Define buffer region to ignore edge peaks (e.g., 5% of the signal length)
+        buffer = int(0.05 * len(smooth_envelope))
+
+        # Keep only peaks that are not too close to the start or end
+        valid_peak_indices = peak_indices[(peak_indices > buffer) & (peak_indices < len(smooth_envelope) - buffer)]
+
+        if len(peak_indices):
+            dominant_freq = np.median(freqs[valid_peak_indices])
         else:
-            tdoas[i] = np.nan  # No peak from this sensor
+            dominant_freq = 0.0
+        estimated_freqs[label] = dominant_freq
 
-    # Replace NaNs with 0 or interpolate
-    nan_mask = np.isnan(tdoas)
-    if np.sum(~nan_mask) < 3:
-        print(f"Cluster {cluster_id}: Not enough valid TDOAs.")
-        continue
+        plt.figure(figsize=(4, 4))
+        plt.plot(freqs, fft_mag, label="FFT Magnitude")
+        plt.plot(freqs, smooth_envelope, label="Smoothed Envelope", linestyle='--')
 
-    # Optional: zero-fill NaNs (or interpolate if needed)
-    tdoas[nan_mask] = 0
+        if dominant_freq:
+            plt.axvline(dominant_freq, color='r', linestyle='--')
+            plt.text(
+                dominant_freq + 0.05,  # slight horizontal offset
+                max(smooth_envelope) * 1.3,  # vertical placement
+                f"{dominant_freq:.2f} Hz",
+                color='r',
+                fontsize=9,
+                rotation=0,
+                verticalalignment='top'
+            )
 
-    # Run grid search localization
-    est_pos, error_map, grid_x, grid_y = grid_search_localization(sensor_coords, tdoas, ref_index=ref_idx)
+        plt.xlim(0, 5)
+        plt.title(f"Cluster {label} Spectrum + Envelope")
+        plt.xlabel("Frequency (Hz)")
+        plt.ylabel("Magnitude")
+        plt.grid(True)
+        plt.tight_layout()
+        plt.show()
 
-    cluster_sources[cluster_id] = (est_pos, error_map)
-    print(f"Estimated location for cluster {cluster_id}: {est_pos}")
+    # === Reorder clusters so Cluster 0 is always the lower frequency ===
+    if estimated_freqs[0] > estimated_freqs[1]:
+        print("Swapping cluster labels to ensure cluster 0 is lower frequency...")
+        # Swap frequencies
+        estimated_freqs[0], estimated_freqs[1] = estimated_freqs[1], estimated_freqs[0]
+        # Swap signals
+        cluster_signals[0], cluster_signals[1] = cluster_signals[1], cluster_signals[0]
+        # Swap labels
+        labels = 1 - labels  # Invert 0 <-> 1
 
-# === Step 7: Separate signals by speaker cluster and analyze ===
-speaker_signals = {0: np.zeros_like(signals), 1: np.zeros_like(signals)}
-window_size = 15  # samples before and after peak
 
-for (t, sensor_idx, peak_idx, amp), label in zip(peak_records, labels):
-    start = max(0, peak_idx - window_size)
-    end = min(len(time), peak_idx + window_size)
-    speaker_signals[label][start:end, sensor_idx] += signals[start:end, sensor_idx]
+    print("\n=== Frequency Estimation Accuracy ===")
+    for label in [0, 1]:
+        est_freq = estimated_freqs[label]
+        true_freq = true_freqs[label]
+        percent_error = abs(est_freq - true_freq) / true_freq * 100 if true_freq > 0 else np.nan
+        print(f"Cluster {label}:")
+        print(f"  Estimated Frequency: {est_freq:.3f} Hz")
+        print(f"  Closest True Frequency: {true_freq:.3f} Hz")
+        print(f"  Percent Error: {percent_error:.2f}%\n")
 
-# Sampling frequency
-fs = 1 / np.mean(np.diff(time))
-true_freqs = [2.36, 2.867]  # already sorted: low → high
-estimated_freqs = [0, 0]
+    print("\n=== Location Estimation ===")
+    for cid in [0, 1]:
+        cluster_idx = np.where(labels == cid)[0]
+        print(f"Cluster {cid} assigned {len(cluster_idx)} peaks.")
 
-# === Step 8: Remap cluster labels so Cluster 0 = lower freq, Cluster 1 = higher freq ===
-# === Step 1: Check frequency spread in each cluster ===
-cluster_peak_freqs = {}
-cluster_needs_reassign = False
+        if len(cluster_idx) == 0:
+            print(f"⚠️ Cluster {cid} is empty. Skipping location estimation.")
+            continue
 
-for label in [0, 1]:
-    avg_signal = np.mean(speaker_signals[label], axis=1)
-    fft_magnitude = np.abs(np.fft.rfft(avg_signal))
-    frequencies = np.fft.rfftfreq(len(avg_signal), d=1 / fs)
+        cluster_peaks = [peak_records[i][2] for i in cluster_idx]
+        cluster_tdoas = estimate_tdoas_crosscorr(signals, cluster_peaks, fs, ref_idx=REF_IDX, window_size=WINDOW_SIZE)
 
-    peak_indices, _ = find_peaks(fft_magnitude, height=0.3 * np.max(fft_magnitude))
-    peak_freqs = frequencies[peak_indices]
-    cluster_peak_freqs[label] = peak_freqs
+        # Full TDOA vector including 0.0 at REF_IDX
+        tdoas = [0.0] * len(sensor_coords)
+        j = 0
+        for i in range(len(sensor_coords)):
+            if i == REF_IDX:
+                continue
+            tdoas[i] = cluster_tdoas[j]
+            j += 1
 
-    if len(peak_freqs) >= 2:
-        min_peak = np.min(peak_freqs)
-        max_peak = np.max(peak_freqs)
-        spread = max_peak - min_peak
-        print(f"Cluster {label}: min = {min_peak:.2f} Hz, max = {max_peak:.2f} Hz, spread = {spread:.2f} Hz")
-
-        if spread > 0.35:
-            print(f"⚠️ Cluster {label} exceeds 0.35 Hz spread → will reassign PEAKS.")
-            cluster_needs_reassign = True
-
-# === Step 2: Reassign peaks based on proximity to min vs. max freq ===
-if cluster_needs_reassign:
-    print("🔁 Reassigning PEAKS based on proximity to min/max peak frequency...")
-
-    # Determine global min/max peak frequencies from both clusters
-    all_peaks = np.concatenate([cluster_peak_freqs[0], cluster_peak_freqs[1]])
-    global_min_peak = np.min(all_peaks)
-    global_max_peak = np.max(all_peaks)
-
-    # Reassign each peak
-    reassigned_labels = []
-    peak_freqs = []
-
-    for (t, sensor_id, peak_idx, amp) in peak_records:
-        signal = signals[:, sensor_id]
-        segment = signal[max(0, peak_idx - window_size):min(len(signal), peak_idx + window_size)]
-        fft_mag = np.abs(np.fft.rfft(segment))
-        freqs = np.fft.rfftfreq(len(segment), d=1/fs)
-        peak_idx_seg, _ = find_peaks(fft_mag, height=0.3 * np.max(fft_mag))
-        segment_peaks = freqs[peak_idx_seg]
-
-        if len(segment_peaks) == 0:
-            dominant_freq = 0  # fallback
+        # Try multilateration with all sensors
+        location = multilateration(sensor_coords, tdoas, SOUND_SPEED, ref_index=REF_IDX)
+        if location is not None:
+            print(
+                f"Estimated source location (multilateration) for cluster {cid}: ({location[0]:.2f}, {location[1]:.2f})")
         else:
-            dominant_freq = np.mean(segment_peaks)
+            print(f"⚠️ Multilateration failed. Falling back to grid search.")
+            location, error_grid, grid_x, grid_y = grid_search_localization(
+                sensor_coords, tdoas, ref_index=REF_IDX, sound_speed=SOUND_SPEED, grid_size=100
+            )
+            print(f"Estimated source location (grid search) for cluster {cid}: ({location[0]:.2f}, {location[1]:.2f})")
 
-        peak_freqs.append(dominant_freq)
-        # Assign label based on proximity to min or max
-        if abs(dominant_freq - global_min_peak) < abs(dominant_freq - global_max_peak):
-            reassigned_labels.append(0)
-        else:
-            reassigned_labels.append(1)
-
-    labels = reassigned_labels
-    print("✅ Reassignment complete.")
-
-else:
-    print("✅ No reassignment needed.")
-
-from scipy.signal import find_peaks
-
-# === Step 3: Remap labels so Cluster 0 = lower freq ===
-print("=== Final Remap: Cluster 0 = lower frequency ===")
-
-# Estimate median frequency per cluster based on peak segment FFTs
-cluster_freqs = {0: [], 1: []}
-
-for (t, sensor_id, peak_idx, amp), label in zip(peak_records, labels):
-    segment = signals[max(0, peak_idx - window_size):min(len(signals), peak_idx + window_size), sensor_id]
-    fft_mag = np.abs(np.fft.rfft(segment))
-    freqs = np.fft.rfftfreq(len(segment), d=1/fs)
-    peak_indices, _ = find_peaks(fft_mag, height=0.3 * np.max(fft_mag))
-    if len(peak_indices) > 0:
-        dominant_freq = np.mean(freqs[peak_indices])
-        cluster_freqs[label].append(dominant_freq)
-
-median_freqs = [np.median(cluster_freqs[0]), np.median(cluster_freqs[1])]
-lower_label = int(np.argmin(median_freqs))
-higher_label = 1 - lower_label
-label_map = {lower_label: 0, higher_label: 1}
-print(f"Remapping labels: {label_map} (lower freq → Cluster 0, higher freq → Cluster 1)")
-
-# Apply remapping
-remapped_labels = np.array([label_map[l] for l in labels])
-speaker_signals = {0: np.zeros_like(signals), 1: np.zeros_like(signals)}
-cluster_peaks = {0: {}, 1: {}}
-
-for (t, sensor_id, peak_idx, amp), original_label in zip(peak_records, labels):
-    new_label = label_map[original_label]
-    start = max(0, peak_idx - window_size)
-    end = min(len(time), peak_idx + window_size)
-    speaker_signals[new_label][start:end, sensor_id] += signals[start:end, sensor_id]
-    if sensor_id not in cluster_peaks[new_label] or t < time[cluster_peaks[new_label][sensor_id]]:
-        cluster_peaks[new_label][sensor_id] = peak_idx
-
-# === Step 9: Visualizations ===
-
-# --- Plot spectrum and estimated frequency per cluster ---
-estimated_freqs = {}
-
-fig, axs = plt.subplots(1, 2, figsize=(14, 5), sharey=True)
-
-for label in [0, 1]:
-    avg_signal = np.mean(speaker_signals[label], axis=1)
-    fft_magnitude = np.abs(np.fft.rfft(avg_signal))
-    frequencies = np.fft.rfftfreq(len(avg_signal), d=1 / fs)
-
-    peak_indices, _ = find_peaks(fft_magnitude, height=0.6 * np.max(fft_magnitude))
-    peak_freqs = frequencies[peak_indices]
-    peak_mags = fft_magnitude[peak_indices]
-
-    estimated_freq = np.median(peak_freqs) if len(peak_freqs) > 0 else 0
-    estimated_freqs[label] = estimated_freq
-
-    ax = axs[label]
-    ax.plot(frequencies, fft_magnitude, label='Spectrum')
-    ax.plot(peak_freqs, peak_mags, 'o', label='Peaks')
-
-    for f, m in zip(peak_freqs, peak_mags):
-        ax.annotate(f'{f:.2f} Hz', xy=(f, m), xytext=(5, 5),
-                    textcoords='offset points', fontsize=8)
-
-    ax.set_title(f"Cluster {label} Frequency Spectrum")
-    ax.set_xlabel("Frequency (Hz)")
-    ax.grid(True)
-    ax.legend()
-
-    # Frequency error printout
-    percent_error = abs(estimated_freq - true_freqs[label]) / true_freqs[label] * 100
-    print(f"Cluster {label}:")
-    print(f"  Estimated Frequency: {estimated_freq:.3f} Hz")
-    print(f"  True Frequency: {true_freqs[label]:.2f} Hz")
-    print(f"  Percent Error: {percent_error:.2f}%\n")
-
-axs[0].set_ylabel("Magnitude")
-plt.tight_layout()
-plt.show()
-
-# --- Plot voltage signals over time ---
-plt.figure(figsize=(12, 6))
-for label in [0, 1]:
-    avg_signal = np.mean(speaker_signals[label], axis=1)
-    plt.plot(time, avg_signal, label=f'Cluster {label} Avg Voltage')
-
-plt.title("Remapped Voltage Signals Over Time")
-plt.xlabel("Time (s)")
-plt.ylabel("Amplitude (V)")
-plt.legend()
-plt.grid(True)
-plt.tight_layout()
-plt.show()
+if __name__ == "__main__":
+    main()

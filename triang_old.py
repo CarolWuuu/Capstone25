@@ -12,8 +12,8 @@ SOUND_SPEED = 162900  # cm/s
 REF_IDX = 0
 WINDOW_SIZE = 35
 
-file_path = "filtered_piezo_voltage_log-4&4-t3.csv"
-true_freqs = [1.833, 1.833]
+file_path = "filtered/filtered_piezo_voltage_log-1&3-t1.csv"
+true_freqs = [2.375, 2.45]
 
 # Sensor coordinates (centimeters)
 sensor_coords = np.array([
@@ -192,16 +192,27 @@ def main():
             dominant_freq = 0.0
         estimated_freqs[label] = dominant_freq
 
-        plt.figure(figsize=(10, 4))
+        plt.figure(figsize=(4, 4))
         plt.plot(freqs, fft_mag, label="FFT Magnitude")
         plt.plot(freqs, smooth_envelope, label="Smoothed Envelope", linestyle='--')
+
         if dominant_freq:
-            plt.axvline(dominant_freq, color='r', linestyle='--', label=f'Median Peak: {dominant_freq:.2f} Hz')
+            plt.axvline(dominant_freq, color='r', linestyle='--')
+            plt.text(
+                dominant_freq + 0.05,  # slight horizontal offset
+                max(smooth_envelope) * 1.3,  # vertical placement
+                f"{dominant_freq:.2f} Hz",
+                color='r',
+                fontsize=9,
+                rotation=0,
+                verticalalignment='top'
+            )
+
+        plt.xlim(0, 5)
         plt.title(f"Cluster {label} Spectrum + Envelope")
         plt.xlabel("Frequency (Hz)")
         plt.ylabel("Magnitude")
         plt.grid(True)
-        plt.legend()
         plt.tight_layout()
         plt.show()
 
