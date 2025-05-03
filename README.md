@@ -12,3 +12,7 @@ FHR numbering
 - FHR 2: 172 bpm
 - FHR 3: 142 bpm
 - FHR 4: 110 bpm
+
+Note:
+- Name mp3 files in TF card as 0001.mp3, 0002.mp3, etc. No folder needed.
+- Due to the file size or recording quality, the 110 BPM fetal heart rate audio must be stored on the TF card as a standalone file, with no other recordings present.
