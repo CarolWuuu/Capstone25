@@ -74,19 +74,30 @@ cleaned_data.to_csv('filtered/filtered_piezo_voltage_log-1&3-t1.csv', index=Fals
 print("Cleaned data saved to 'cleaned_piezo_voltage_log.csv'.")
 
 # === Plot original and cleaned data for each sensor ===
-plt.figure(figsize=(8, 6))
+plt.figure(figsize=(10, 8))
+
 for i, sensor in enumerate(sensor_columns, 1):
-    plt.subplot(len(sensor_columns), 1, i)
+    ax = plt.subplot(len(sensor_columns), 1, i)
     plt.plot(df['Timestamp_s'], df[sensor], label='Original', alpha=0.5)
     plt.plot(cleaned_data['Timestamp_s'], cleaned_data[sensor], label='Cleaned', color='red')
-    plt.title(sensor)
-    plt.xlabel('Time (s)')
-    plt.ylabel('Voltage (V)')
-    # Show legend only in the first subplot
+    plt.title(f'Piezo #{i}')
+
+    # Only show legend on the first subplot
     if i == 1:
         plt.legend()
-    plt.tight_layout()
+
+    # Remove individual x and y labels
+    if i != len(sensor_columns):
+        ax.set_xlabel('')
+    if i != 1:
+        ax.set_ylabel('')
+
+# Add shared x and y labels for the whole figure
+plt.xlabel('Time (s)', fontsize=12, labelpad=20)
+plt.ylabel('Voltage (V)', fontsize=12, labelpad=30)
+plt.tight_layout(rect=[0, 0, 1, 0.97])  # leave space for labels
 plt.show()
+
 
 # === Get data ===
 time_unfiltered = df['Timestamp_s']

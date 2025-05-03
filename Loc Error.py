@@ -16,8 +16,8 @@ sensor_coords = np.array([
 
 # True speaker locations and colors
 true_locations = {
-    'A': {'coords': [7, 16], 'color': 'red', 'label': 'Speaker 1 (A)'},
-    'B': {'coords': [7, 6], 'color': 'blue', 'label': 'Speaker 2 (B)'}
+    'A': {'coords': [7, 16], 'color': 'red', 'label': 'Source A'},
+    'B': {'coords': [7, 6], 'color': 'blue', 'label': 'Source B'}
 }
 
 # Create figure
@@ -25,7 +25,7 @@ fig, ax = plt.subplots(figsize=(4, 5))
 ax.set_xlim(0, 14)
 ax.set_ylim(0, 22)
 ax.set_aspect('equal')
-ax.set_title("True and Estimated Speaker Locations with Sensor Positions")
+ax.set_title("Estimated Source Locations")
 ax.set_xlabel("X (cm)")
 ax.set_ylabel("Y (cm)")
 
@@ -49,6 +49,7 @@ for speaker, info in true_locations.items():
     ax.text(true_x + 0.3, true_y + 0.3, info['label'], color=color, fontsize=10, fontweight='bold')
 
     error_radius = np.mean(np.sqrt((est_x - true_x) ** 2 + (est_y - true_y) ** 2))
+    print(error_radius)
     circle = plt.Circle((true_x, true_y), error_radius, color=color, alpha=0.2, label=f"{info['label']} Error Range")
     ax.add_patch(circle)
 

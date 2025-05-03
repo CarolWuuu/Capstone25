@@ -18,9 +18,9 @@ pivot_B = avg_error_df[avg_error_df['Speaker'] == 'B'].pivot(
 pivot_A = pivot_A.sort_index(ascending=False).sort_index(axis=1)
 pivot_B = pivot_B.sort_index(ascending=False).sort_index(axis=1)
 
-# Create custom colormap with grey for NaNs
-cmap = sns.color_palette("viridis", as_cmap=True)
-cmap.set_bad(color='gray')
+# Create a red-blue colormap (low = blue, high = red)
+cmap = sns.color_palette("coolwarm", as_cmap=True)  # blue to red
+cmap.set_bad(color='lightgray')  # set color for NaNs
 
 # Plot
 fig, axs = plt.subplots(2, 1, figsize=(5, 6))
