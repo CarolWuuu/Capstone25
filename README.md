@@ -7,7 +7,8 @@ Workflow
 6. run Loc Error.py with All_Final_estimated_Locations.csv (from running triang_wDataCollection.py)
 
 FHR numbering
-FHR 1: 147 bpm
-FHR 2: 172 bpm
-FHR 3: 142 bpm
-FHR 4: 110 bpm
+
+- FHR 1: 147 bpm
+- FHR 2: 172 bpm
+- FHR 3: 142 bpm
+- FHR 4: 110 bpm
